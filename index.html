@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kanban</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232563eb'/><rect x='7' y='8' width='5' height='16' rx='1.5' fill='white'/><rect x='14' y='8' width='5' height='10' rx='1.5' fill='white'/><rect x='21' y='8' width='5' height='13' rx='1.5' fill='white'/></svg>" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <select id="projectSelect" title="프로젝트 전환"></select>
+      <button class="icon-btn" id="projectMenuBtn" title="프로젝트 관리">⋯</button>
+    </div>
+
+    <nav class="views" role="tablist">
+      <button class="view-btn active" data-view="board" role="tab">보드</button>
+      <button class="view-btn" data-view="list" role="tab">목록</button>
+    </nav>
+
+    <div class="filters">
+      <div class="search">
+        <input id="search" type="search" placeholder="검색  ( / )" autocomplete="off" />
+      </div>
+      <select id="filterType" title="유형">
+        <option value="">모든 유형</option>
+      </select>
+      <select id="filterPriority" title="우선순위">
+        <option value="">모든 우선순위</option>
+      </select>
+      <select id="filterLabel" title="라벨">
+        <option value="">모든 라벨</option>
+      </select>
+      <button class="text-btn" id="clearFilters" hidden>필터 지우기</button>
+    </div>
+
+    <div class="actions">
+      <button class="primary" id="createBtn" title="새 이슈 (C)">+ 만들기</button>
+      <button class="icon-btn" id="themeBtn" title="테마 전환">◐</button>
+      <button class="icon-btn" id="menuBtn" title="메뉴">☰</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="boardView" class="board" aria-label="칸반 보드"></section>
+    <section id="listView" class="list" hidden></section>
+  </main>
+
+  <!-- Issue detail / create -->
+  <div class="overlay" id="issueOverlay" hidden>
+    <div class="modal issue-modal" role="dialog" aria-modal="true" aria-labelledby="issueTitle">
+      <div class="modal-head">
+        <span class="issue-key" id="issueKey"></span>
+        <div class="spacer"></div>
+        <button class="text-btn danger" id="deleteIssueBtn">삭제</button>
+        <button class="icon-btn" data-close title="닫기 (Esc)">✕</button>
+      </div>
+      <div class="issue-body">
+        <div class="issue-main">
+          <textarea id="issueTitle" class="title-input" rows="1" placeholder="요약을 입력하세요"></textarea>
+
+          <div class="field-head">
+            <label>설명</label>
+            <button class="text-btn small" id="descToggle">편집</button>
+          </div>
+          <div id="descPreview" class="desc-preview" tabindex="0"></div>
+          <textarea id="issueDesc" class="desc-input" placeholder="설명 (마크다운 일부 지원: **굵게**, `코드`, - 목록, [링크](url))" hidden></textarea>
+
+          <div class="field-head">
+            <label>체크리스트 <span id="checkProgress" class="muted"></span></label>
+          </div>
+          <div class="progress"><div id="checkBar"></div></div>
+          <ul id="checklist" class="checklist"></ul>
+          <input id="checkInput" class="inline-input" placeholder="+ 항목 추가 후 Enter" />
+
+          <div class="field-head"><label>댓글</label></div>
+          <div class="comment-box">
+            <textarea id="commentInput" rows="2" placeholder="댓글 추가…  (Ctrl/⌘+Enter 저장)"></textarea>
+            <button class="primary small" id="commentBtn">저장</button>
+          </div>
+          <ul id="comments" class="comments"></ul>
+        </div>
+
+        <aside class="issue-side">
+          <label>상태<select id="issueStatus"></select></label>
+          <label>유형<select id="issueType"></select></label>
+          <label>우선순위<select id="issuePriority"></select></label>
+          <label>마감일<input id="issueDue" type="date" /></label>
+          <label>예상 포인트<input id="issuePoints" type="number" min="0" step="1" placeholder="-" /></label>
+          <label>라벨
+            <div class="labels-edit" id="labelsEdit">
+              <input id="labelInput" placeholder="입력 후 Enter" list="labelList" />
+            </div>
+            <datalist id="labelList"></datalist>
+          </label>
+          <div class="meta" id="issueMeta"></div>
+          <button class="primary wide" id="createConfirmBtn" hidden>만들기 (Ctrl/⌘+Enter)</button>
+        </aside>
+      </div>
+    </div>
+  </div>
+
+  <!-- Generic small dialog -->
+  <div class="overlay" id="dialogOverlay" hidden>
+    <div class="modal small-modal" role="dialog" aria-modal="true">
+      <div class="modal-head">
+        <strong id="dialogTitle"></strong>
+        <div class="spacer"></div>
+        <button class="icon-btn" data-close>✕</button>
+      </div>
+      <div id="dialogBody" class="dialog-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+  <input type="file" id="importFile" accept="application/json,.json" hidden />
+
+  <script src="app.js"></script>
+</body>
+</html>
