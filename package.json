@@ -2,11 +2,19 @@
   "name": "jira-like-kanban",
   "version": "2.0.0",
   "private": true,
-  "description": "1인 개발자용 Jira-like 칸반 보드 (Node + SQLite, 의존성 없음)",
+  "description": "1인 개발자용 Jira-like 칸반 보드 (Cloudflare Workers + Durable Objects, 또는 Node + SQLite)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "cf:dev": "wrangler dev",
+    "deploy": "wrangler deploy"
   },
-  "engines": { "node": ">=22.13" }
+  "engines": {
+    "node": ">=22.13"
+  },
+  "type": "module",
+  "devDependencies": {
+    "wrangler": "^4.168.0"
+  }
 }

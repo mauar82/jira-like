@@ -273,6 +273,7 @@
   async function reloadState() {
     const data = await api('GET', '/api/state');
     authRequired = !!data.auth;
+    realtime = data.realtime || 'sse';
     state.projects = data.projects;
     state.issues = data.issues;
     normalize(state);
@@ -281,21 +282,50 @@
     refreshUi();
   }
 
-  let events = null;
+  // Live updates: SSE on the Node server, WebSocket on Cloudflare (Durable Object).
+  let realtime = 'sse';
+  let events = null, ws = null, wsTimer = null, wsPing = null, wsDelay = 1000;
+  let liveOpened = false;
+  function onLiveMessage(msg) {
+    if (msg.type === 'reload') reloadState().catch(() => { });
+    else if (msg.type === 'change' || msg.projects) applyRemote(msg);
+  }
+  function onLiveOpen() {
+    // After a reconnect we may have missed events: fetch everything again (once our queue is flushed).
+    if (liveOpened && !outboxSize() && !sending) reloadState().catch(() => { });
+    liveOpened = true;
+    if (saveStatus === 'offline') { setSaveStatus(outboxSize() ? 'busy' : 'ok'); sendOutbox(); }
+  }
+  function onLiveLost() { if (!outboxSize()) setSaveStatus('offline', '서버 연결 끊김 — 재연결 중'); }
+
   function connectEvents() {
+    if (realtime === 'ws') return connectWs();
     if (events) events.close();
     events = new EventSource('/api/events');
-    let opened = false;
     events.addEventListener('change', e => { try { applyRemote(JSON.parse(e.data)); } catch (err) { console.warn(err); } });
     events.addEventListener('reload', () => reloadState().catch(() => { }));
-    events.addEventListener('open', () => {
-      // After a reconnect we may have missed events: fetch everything again (once our queue is flushed).
-      if (opened && !outboxSize() && !sending) reloadState().catch(() => { });
-      opened = true;
-      if (saveStatus === 'offline') { setSaveStatus(outboxSize() ? 'busy' : 'ok'); sendOutbox(); }
-    });
-    events.addEventListener('error', () => { if (!outboxSize()) setSaveStatus('offline', '서버 연결 끊김 — 재연결 중'); });
+    events.addEventListener('open', onLiveOpen);
+    events.addEventListener('error', onLiveLost);
   }
+  function connectWs() {
+    clearTimeout(wsTimer); clearInterval(wsPing);
+    if (ws) { ws.onclose = null; ws.close(); }
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/ws`);
+    ws.onopen = () => { wsDelay = 1000; onLiveOpen(); wsPing = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 30000); };
+    ws.onmessage = e => { if (e.data === 'pong') return; try { onLiveMessage(JSON.parse(e.data)); } catch (err) { console.warn(err); } };
+    ws.onclose = () => {
+      clearInterval(wsPing);
+      onLiveLost();
+      wsTimer = setTimeout(connectWs, wsDelay);
+      wsDelay = Math.min(wsDelay * 2, 15000);
+    };
+  }
+  // Phones suspend background tabs: reconnect and refresh when the page becomes visible again.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !loaded) return;
+    if (realtime === 'ws' && (!ws || ws.readyState > 1)) connectWs();
+    else if (!outboxSize() && !sending) reloadState().catch(() => { });
+  });
 
   let saveTimer = null;
   function flushSave() {
@@ -1235,7 +1265,7 @@
     } catch (e) {
       if (e.status === 401) { showLogin(); return; }
       boardEl.innerHTML = '';
-      boardEl.append(el('div', { class: 'empty' }, `서버에 연결할 수 없습니다: ${e.message}`, el('br'), el('button', { class: 'primary', style: 'margin-top:12px', text: '다시 시도', onclick: boot })));
+      boardEl.append(el('div', { class: 'empty' }, e.status ? e.message : `서버에 연결할 수 없습니다: ${e.message}`, el('br'), el('button', { class: 'primary', style: 'margin-top:12px', text: '다시 시도', onclick: boot })));
       return;
     }
     dialogOverlay.querySelector('[data-close]').hidden = false;

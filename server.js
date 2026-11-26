@@ -4,17 +4,18 @@
  *
  *   PORT=3000 HOST=127.0.0.1 DB_PATH=./data/kanban.db KANBAN_PASSWORD=secret node server.js
  */
-'use strict';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+import { createBoard, HttpError } from './core.js';
 
 process.removeAllListeners('warning'); // silence node:sqlite "experimental" warning
 process.on('warning', w => { if (w.name !== 'ExperimentalWarning') console.warn(w); });
+const { DatabaseSync } = await import('node:sqlite');
 
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
-const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
-
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = +process.env.PORT || 3000;
 const HOST = process.env.HOST || '127.0.0.1';
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data', 'kanban.db');
@@ -24,176 +25,25 @@ const MAX_BODY = 20 * 1024 * 1024;
 
 // ---------- database ----------
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-const db = new DatabaseSync(DB_PATH);
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
-  CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY,
-    key TEXT NOT NULL UNIQUE,
-    next_num INTEGER NOT NULL DEFAULT 1,
-    data TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-  );
-  CREATE TABLE IF NOT EXISTS issues (
-    id TEXT PRIMARY KEY,
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    num INTEGER NOT NULL,
-    data TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (project_id, num)
-  );
-  CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
-`);
-
-const q = {
-  allProjects: db.prepare('SELECT data, next_num FROM projects ORDER BY rowid'),
-  allIssues: db.prepare('SELECT data, num FROM issues ORDER BY project_id, num'),
-  getProject: db.prepare('SELECT id, key, next_num FROM projects WHERE id = ?'),
-  projectByKey: db.prepare('SELECT id FROM projects WHERE key = ?'),
-  insProject: db.prepare('INSERT INTO projects (id, key, next_num, data, updated_at) VALUES (?, ?, ?, ?, ?)'),
-  updProject: db.prepare('UPDATE projects SET key = ?, data = ?, updated_at = ? WHERE id = ?'),
-  bumpNum: db.prepare('UPDATE projects SET next_num = ? WHERE id = ?'),
-  delProject: db.prepare('DELETE FROM projects WHERE id = ?'),
-  getIssue: db.prepare('SELECT id, project_id, num FROM issues WHERE id = ?'),
-  numTaken: db.prepare('SELECT id FROM issues WHERE project_id = ? AND num = ?'),
-  insIssue: db.prepare('INSERT INTO issues (id, project_id, num, data, updated_at) VALUES (?, ?, ?, ?, ?)'),
-  updIssue: db.prepare('UPDATE issues SET project_id = ?, num = ?, data = ?, updated_at = ? WHERE id = ?'),
-  delIssue: db.prepare('DELETE FROM issues WHERE id = ?'),
-  getSetting: db.prepare('SELECT v FROM settings WHERE k = ?'),
-  setSetting: db.prepare('INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v'),
-};
-
-function tx(fn) {
-  db.exec('BEGIN IMMEDIATE');
-  try { const r = fn(); db.exec('COMMIT'); return r; }
-  catch (e) { db.exec('ROLLBACK'); throw e; }
-}
-
-class HttpError extends Error { constructor(status, msg) { super(msg); this.status = status; } }
-
-const nowIso = () => new Date().toISOString();
-const uid = () => crypto.randomBytes(6).toString('base64url');
-
-function readState() {
-  return {
-    projects: q.allProjects.all().map(r => ({ ...JSON.parse(r.data), nextNum: r.next_num })),
-    issues: q.allIssues.all().map(r => ({ ...JSON.parse(r.data), num: r.num })),
-  };
-}
-
-// ---------- validation ----------
-const isStr = (v, max = 200) => typeof v === 'string' && v.length > 0 && v.length <= max;
-function checkProject(p) {
-  if (!p || !isStr(p.id, 64)) throw new HttpError(400, 'project.id 필요');
-  if (!isStr(p.name, 200)) throw new HttpError(400, '프로젝트 이름 필요');
-  if (typeof p.key !== 'string' || !/^[A-Z][A-Z0-9]{0,9}$/.test(p.key)) throw new HttpError(400, '프로젝트 키는 영문 대문자로 시작 (최대 10자)');
-  if (!Array.isArray(p.columns) || !p.columns.length || !p.columns.every(c => c && isStr(c.id, 64) && isStr(c.name, 100)))
-    throw new HttpError(400, '컬럼 형식 오류');
-}
-function checkIssue(i) {
-  if (!i || !isStr(i.id, 64) || !isStr(i.projectId, 64)) throw new HttpError(400, 'issue.id / projectId 필요');
-  if (typeof i.title !== 'string' || i.title.length > 2000) throw new HttpError(400, '제목 형식 오류');
-}
-
-// ---------- writes ----------
-function upsertProject(p) {
-  checkProject(p);
-  const { nextNum, ...data } = p;
-  const t = data.updatedAt || nowIso();
-  const other = q.projectByKey.get(p.key);
-  if (other && other.id !== p.id) throw new HttpError(409, `프로젝트 키 ${p.key} 는 이미 사용 중입니다`);
-  const cur = q.getProject.get(p.id);
-  if (cur) q.updProject.run(p.key, JSON.stringify(data), t, p.id);
-  else q.insProject.run(p.id, p.key, Math.max(1, +nextNum || 1), JSON.stringify(data), t);
-  const row = q.getProject.get(p.id);
-  return { ...data, nextNum: row.next_num };
-}
-
-// Issue numbers are allocated here so two devices can never create the same key.
-function upsertIssue(i) {
-  checkIssue(i);
-  const proj = q.getProject.get(i.projectId);
-  if (!proj) throw new HttpError(404, '프로젝트가 없습니다 (다른 기기에서 삭제됨?)');
-  const { num: wanted, ...data } = i;
-  const t = data.updatedAt || nowIso();
-  const cur = q.getIssue.get(i.id);
-  let num;
-  if (cur && cur.project_id === i.projectId) num = cur.num;
-  else {
-    const w = Number.isInteger(wanted) && wanted > 0 ? wanted : 0;
-    const taken = w ? q.numTaken.get(i.projectId, w) : true;
-    num = taken || (w >= proj.next_num + 1000) ? proj.next_num : w; // keep the client's number when free (e.g. undo delete)
-  }
-  if (num >= proj.next_num) q.bumpNum.run(num + 1, proj.id);
-  if (cur) q.updIssue.run(i.projectId, num, JSON.stringify(data), t, i.id);
-  else q.insIssue.run(i.id, i.projectId, num, JSON.stringify(data), t);
-  return { ...data, num };
-}
-
-function applyChanges(body) {
-  const projects = Array.isArray(body.projects) ? body.projects : [];
-  const issues = Array.isArray(body.issues) ? body.issues : [];
-  const deleted = Array.isArray(body.deleted) ? body.deleted.filter(id => typeof id === 'string') : [];
-  return tx(() => {
-    const out = { projects: projects.map(upsertProject), issues: [], deleted: [] };
-    const deletedSet = new Set(deleted);
-    // Issues of a project that is being deleted in the same request are skipped.
-    out.issues = issues.filter(i => !deletedSet.has(i?.projectId)).map(upsertIssue);
-    for (const id of deleted) {
-      if (q.delIssue.run(id).changes || q.delProject.run(id).changes) out.deleted.push(id);
-    }
-    if (!q.allProjects.all().length) throw new HttpError(400, '마지막 프로젝트는 삭제할 수 없습니다');
-    // Projects touched by new issues have a new nextNum.
-    const touched = new Set(out.issues.map(i => i.projectId));
-    const fresh = touched.size ? readState().projects : [];
-    for (const pid of touched) if (!out.projects.some(p => p.id === pid)) {
-      const full = fresh.find(p => p.id === pid);
-      if (full) out.projects.push(full);
-    }
-    return out;
-  });
-}
-
-function importAll(body) {
-  if (!body || !Array.isArray(body.projects) || !Array.isArray(body.issues) || !body.projects.length)
-    throw new HttpError(400, 'projects / issues 배열이 필요합니다');
-  tx(() => {
-    db.exec('DELETE FROM issues; DELETE FROM projects;');
-    for (const p of body.projects) upsertProject(p);
-    for (const i of body.issues) if (q.getProject.get(i.projectId)) upsertIssue(i);
-  });
-}
-
-function seedIfEmpty() {
-  if (q.allProjects.all().length) return;
-  const t = nowIso();
-  const cols = [
-    { id: uid(), name: '할 일', done: false },
-    { id: uid(), name: '진행 중', done: false, wip: 3 },
-    { id: uid(), name: '리뷰', done: false },
-    { id: uid(), name: '완료', done: true },
-  ];
-  const pid = uid();
-  const issue = (n, col, title, extra = {}) => ({
-    id: uid(), projectId: pid, num: n, title, desc: '', type: 'task', priority: 'medium', status: col.id, order: n,
-    labels: [], due: '', points: null, checklist: [], comments: [], createdAt: t, updatedAt: t, ...extra,
-  });
-  applyChanges({
-    projects: [{ id: pid, key: 'DEV', name: '내 프로젝트', columns: cols, nextNum: 1, updatedAt: t }],
-    issues: [
-      issue(1, cols[0], '카드를 드래그해서 다른 컬럼으로 옮겨보세요', { type: 'story', labels: ['가이드'] }),
-      issue(2, cols[0], '빠른 생성: "로그인 버그 #auth !high" 처럼 입력하면 라벨·우선순위가 자동 지정됩니다', { labels: ['가이드'], priority: 'high' }),
-      issue(3, cols[1], '단축키는 ? 키로 확인', { labels: ['가이드'], checklist: [{ id: uid(), text: 'C — 새 이슈', done: true }, { id: uid(), text: '/ — 검색', done: false }] }),
-      issue(4, cols[3], '보드 만들기', { type: 'epic' }),
-    ],
-  });
-}
-seedIfEmpty();
+const sqlite = new DatabaseSync(DB_PATH);
+sqlite.exec('PRAGMA journal_mode = WAL;');
+const stmts = new Map();
+const prep = sql => { let st = stmts.get(sql); if (!st) { st = sqlite.prepare(sql); stmts.set(sql, st); } return st; };
+const board = createBoard({
+  all: (sql, ...a) => prep(sql).all(...a),
+  get: (sql, ...a) => prep(sql).get(...a),
+  run: (sql, ...a) => Number(prep(sql).run(...a).changes),
+  exec: sql => sqlite.exec(sql),
+  tx: fn => {
+    sqlite.exec('BEGIN IMMEDIATE');
+    try { const r = fn(); sqlite.exec('COMMIT'); return r; }
+    catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+  },
+});
 
 // ---------- auth (optional single password) ----------
-let secret = q.getSetting.get('secret')?.v;
-if (!secret) { secret = crypto.randomBytes(32).toString('hex'); q.setSetting.run('secret', secret); }
+let secret = board.getSetting('secret');
+if (!secret) { secret = crypto.randomBytes(32).toString('hex'); board.setSetting('secret', secret); }
 // Changing KANBAN_PASSWORD invalidates existing sessions.
 const sessionToken = () => crypto.createHmac('sha256', secret).update('session:' + PASSWORD).digest('base64url');
 const safeEqual = (a, b) => {
@@ -284,19 +134,19 @@ async function handleApi(req, res, pathname) {
 
   if (!authed(req)) throw new HttpError(401, 'login required');
 
-  if (route === 'GET /api/state') return send(res, 200, { ...readState(), auth: !!PASSWORD });
+  if (route === 'GET /api/state') return send(res, 200, { ...board.readState(), auth: !!PASSWORD, realtime: 'sse' });
 
   if (route === 'POST /api/changes') {
     const body = await readJson(req);
-    const saved = applyChanges(body);
+    const saved = board.applyChanges(body);
     broadcast('change', { origin: String(body.clientId || ''), ...saved });
     return send(res, 200, saved);
   }
 
   if (route === 'POST /api/import') {
-    importAll(await readJson(req));
+    board.importAll(await readJson(req));
     broadcast('reload', {});
-    return send(res, 200, readState());
+    return send(res, 200, board.readState());
   }
 
   if (route === 'GET /api/events') {
@@ -329,6 +179,6 @@ server.listen(PORT, HOST, () => {
     console.warn('⚠  KANBAN_PASSWORD 가 설정되지 않았습니다. 외부에 공개된 주소라면 누구나 보드를 수정할 수 있습니다.');
 });
 
-const shutdown = () => { for (const c of clients) c.end(); server.close(() => { db.close(); process.exit(0); }); setTimeout(() => process.exit(0), 2000).unref(); };
+const shutdown = () => { for (const c of clients) c.end(); server.close(() => { sqlite.close(); process.exit(0); }); setTimeout(() => process.exit(0), 2000).unref(); };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);

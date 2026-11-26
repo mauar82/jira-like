@@ -1,0 +1,13 @@
+{
+  // Cloudflare Workers 배포 설정. 비밀번호는 `npx wrangler secret put KANBAN_PASSWORD` 또는 대시보드에서 설정.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "kanban",
+  "main": "worker/index.js",
+  "compatibility_date": "2025-06-01",
+  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "durable_objects": {
+    "bindings": [{ "name": "BOARD", "class_name": "Board" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Board"] }],
+  "observability": { "enabled": true }
+}
