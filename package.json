@@ -1,0 +1,12 @@
+{
+  "name": "jira-like-kanban",
+  "version": "2.0.0",
+  "private": true,
+  "description": "1인 개발자용 Jira-like 칸반 보드 (Node + SQLite, 의존성 없음)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": { "node": ">=22.13" }
+}

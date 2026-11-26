@@ -1,9 +1,8 @@
 /* Kanban — a lightweight Jira-like board. No build step, no dependencies.
- * Data lives in localStorage; use 메뉴 → 내보내기/가져오기 to back up as JSON. */
+ * Data lives on the server (server.js, SQLite); every change is saved immediately. */
 (() => {
   'use strict';
 
-  const STORAGE_KEY = 'kanban.v1';
 
   const TYPES = [
     { id: 'task', name: '작업', icon: '✓' },
@@ -85,46 +84,27 @@
     return out.join('').replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[+i]);
   }
 
-  // ---------- state ----------
+  // ---------- state (source of truth = server) ----------
+  // The browser keeps an in-memory copy. Every change is diffed against a snapshot and sent to the
+  // server immediately (POST /api/changes); other open browsers receive it live via /api/events.
+  const PREFS_KEY = 'kanban.prefs';
   const EPOCH = '2000-01-01T00:00:00.000Z';
-  function defaultState() {
-    const pid = uid();
-    const cols = [
-      { id: uid(), name: '할 일', done: false },
-      { id: uid(), name: '진행 중', done: false, wip: 3 },
-      { id: uid(), name: '리뷰', done: false },
-      { id: uid(), name: '완료', done: true },
-    ];
-    const s = {
-      version: 2,
-      pristine: true, // untouched sample data: replaced (not merged) on first sync
-      theme: matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
-      activeProjectId: pid,
-      projects: [{ id: pid, key: 'DEV', name: '내 프로젝트', columns: cols, nextNum: 1, updatedAt: now() }],
-      issues: [],
-      deleted: {},
-    };
-    const mk = (col, title, extra = {}) => {
-      const p = s.projects[0];
-      s.issues.push({
-        id: uid(), projectId: pid, num: p.nextNum++, title, desc: '', type: 'task', priority: 'medium',
-        status: col.id, order: s.issues.length, labels: [], due: '', points: null, checklist: [], comments: [],
-        createdAt: now(), updatedAt: now(), ...extra,
-      });
-    };
-    mk(cols[0], '카드를 드래그해서 다른 컬럼으로 옮겨보세요', { type: 'story', labels: ['가이드'] });
-    mk(cols[0], '빠른 생성: "로그인 버그 #auth !high" 처럼 입력하면 라벨·우선순위가 자동 지정됩니다', { labels: ['가이드'], priority: 'high' });
-    mk(cols[1], '단축키는 ? 키로 확인', { type: 'task', labels: ['가이드'], checklist: [{ id: uid(), text: 'C — 새 이슈', done: true }, { id: uid(), text: '/ — 검색', done: false }] });
-    mk(cols[3], '보드 만들기', { type: 'epic' });
-    return s;
-  }
+  const clientId = uid();
 
-  const validState = s => s && Array.isArray(s.projects) && Array.isArray(s.issues);
+  let prefs = {};
+  try { prefs = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}'); } catch { }
+  const savePrefs = () => { try { localStorage.setItem(PREFS_KEY, JSON.stringify({ theme: state.theme, activeProjectId: state.activeProjectId })); } catch { } };
 
-  // Fill in fields added in later versions and repair references.
+  let state = {
+    theme: prefs.theme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'),
+    activeProjectId: prefs.activeProjectId,
+    projects: [],
+    issues: [],
+  };
+  let loaded = false;
+  let authRequired = false;
+
   function normalize(s) {
-    s.version = 2;
-    s.deleted = s.deleted && typeof s.deleted === 'object' ? s.deleted : {};
     for (const p of s.projects) {
       p.updatedAt ||= EPOCH;
       p.columns = Array.isArray(p.columns) && p.columns.length ? p.columns : [{ id: uid(), name: '할 일', done: false }];
@@ -143,21 +123,7 @@
     return s;
   }
 
-  function load() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
-        if (validState(s) && s.projects.length) return normalize(s);
-      }
-    } catch (e) { console.warn('load failed', e); }
-    return defaultState();
-  }
-
-  let state = load();
-
-  // Change tracking: every save diffs projects/issues against a snapshot, bumps updatedAt on
-  // anything that changed and records a tombstone for anything that disappeared. Sync relies on it.
+  // Change tracking: diff projects/issues against the last state the server knows about.
   const sigOf = o => { const { updatedAt, nextNum, ...rest } = o; return JSON.stringify(rest); };
   let snap = new Map();
   function rebuildSnap() {
@@ -165,45 +131,210 @@
     for (const p of state.projects) snap.set(p.id, sigOf(p));
     for (const i of state.issues) snap.set(i.id, sigOf(i));
   }
-  rebuildSnap();
-  let localVersion = 0;
-  function trackChanges() {
+  function collectChanges() {
     const t = now();
+    const out = { projects: [], issues: [], deleted: [] };
     const seen = new Set();
-    let changed = false;
-    for (const o of [...state.projects, ...state.issues]) {
-      seen.add(o.id);
-      const sig = sigOf(o);
-      if (snap.get(o.id) !== sig) { o.updatedAt = t; snap.set(o.id, sig); changed = true; }
+    for (const p of state.projects) {
+      seen.add(p.id);
+      const sig = sigOf(p);
+      if (snap.get(p.id) !== sig) { p.updatedAt = t; snap.set(p.id, sig); out.projects.push(p); }
     }
-    for (const id of snap.keys()) if (!seen.has(id)) { state.deleted[id] = t; snap.delete(id); changed = true; }
-    if (changed) { delete state.pristine; localVersion++; }
-    return changed;
+    for (const i of state.issues) {
+      seen.add(i.id);
+      const sig = sigOf(i);
+      if (snap.get(i.id) !== sig) { i.updatedAt = t; snap.set(i.id, sig); out.issues.push(i); }
+    }
+    for (const id of [...snap.keys()]) if (!seen.has(id)) { snap.delete(id); out.deleted.push(id); }
+    return out;
   }
-  function persistLocal() {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }
-    catch (e) { toast('저장 실패: 브라우저 저장공간을 확인하세요'); }
+
+  // ---------- server I/O ----------
+  async function api(method, url, body) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method, cache: 'no-store', credentials: 'same-origin',
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+    } catch { const e = new Error('서버에 연결할 수 없습니다'); e.status = 0; throw e; }
+    let data = null;
+    try { data = await res.json(); } catch { }
+    if (!res.ok) { const e = new Error(data?.error || `HTTP ${res.status}`); e.status = res.status; throw e; }
+    return data;
+  }
+
+  // Outgoing queue: changes are merged per entity and sent one request at a time, in order.
+  const outbox = { projects: new Map(), issues: new Map(), deleted: new Set() };
+  let sending = false, retryTimer = null, retryDelay = 1000;
+  let saveStatus = 'ok', saveMessage = '';
+  const outboxSize = () => outbox.projects.size + outbox.issues.size + outbox.deleted.size;
+
+  function enqueue(ch) {
+    for (const p of ch.projects) outbox.projects.set(p.id, p);
+    for (const i of ch.issues) { outbox.issues.set(i.id, i); outbox.deleted.delete(i.id); }
+    for (const id of ch.deleted) { outbox.deleted.add(id); outbox.projects.delete(id); outbox.issues.delete(id); }
+  }
+
+  async function sendOutbox() {
+    if (sending || !outboxSize()) return;
+    clearTimeout(retryTimer);
+    sending = true;
+    setSaveStatus('busy');
+    const batch = {
+      clientId,
+      projects: [...outbox.projects.values()].map(o => ({ ...o })),
+      issues: [...outbox.issues.values()].map(o => ({ ...o })),
+      deleted: [...outbox.deleted],
+    };
+    outbox.projects.clear(); outbox.issues.clear(); outbox.deleted.clear();
+    try {
+      const saved = await api('POST', '/api/changes', batch);
+      retryDelay = 1000;
+      applySaved(saved);
+      setSaveStatus(outboxSize() ? 'busy' : 'ok');
+    } catch (e) {
+      if (e.status === 401) { requeue(batch); setSaveStatus('error', '로그인이 필요합니다'); showLogin(); }
+      else if (e.status >= 400 && e.status < 500) {
+        // Rejected by the server (validation, duplicate key…): drop it and reload the truth.
+        setSaveStatus('error', e.message);
+        toast('저장 실패: ' + e.message);
+        await reloadState();
+      } else {
+        requeue(batch);
+        setSaveStatus(e.status === 0 ? 'offline' : 'error', e.message);
+        retryTimer = setTimeout(sendOutbox, retryDelay);
+        retryDelay = Math.min(retryDelay * 2, 15000);
+      }
+    } finally {
+      sending = false;
+      if (outboxSize() && saveStatus === 'busy') sendOutbox();
+    }
+  }
+  function requeue(batch) {
+    // Newer edits made while the request was in flight take precedence.
+    for (const p of batch.projects) if (!outbox.projects.has(p.id) && !outbox.deleted.has(p.id)) outbox.projects.set(p.id, getProjectById(p.id) || p);
+    for (const i of batch.issues) if (!outbox.issues.has(i.id) && !outbox.deleted.has(i.id)) { const cur = getIssue(i.id); if (cur) outbox.issues.set(i.id, cur); }
+    for (const id of batch.deleted) outbox.deleted.add(id);
+  }
+
+  // Server may assign a different issue number (another device took it) or a new nextNum.
+  function applySaved(saved) {
+    let changed = false;
+    for (const sp of saved.projects || []) {
+      const p = getProjectById(sp.id);
+      if (p && sp.nextNum > p.nextNum) p.nextNum = sp.nextNum;
+    }
+    for (const si of saved.issues || []) {
+      const i = getIssue(si.id);
+      if (i && i.num !== si.num) {
+        const before = sigOf(i);
+        i.num = si.num;
+        if (snap.get(i.id) === before) snap.set(i.id, sigOf(i));
+        changed = true;
+        if (currentIssueId === i.id) history.replaceState(null, '', '#' + issueKey(i));
+      }
+    }
+    if (changed) refreshUi();
+  }
+
+  // Changes made on other devices / tabs.
+  function applyRemote(ch) {
+    if (ch.origin === clientId) return;
+    for (const rp of ch.projects || []) {
+      if (outbox.projects.has(rp.id)) continue;
+      const idx = state.projects.findIndex(p => p.id === rp.id);
+      if (idx >= 0) state.projects[idx] = rp; else state.projects.push(rp);
+      snap.set(rp.id, sigOf(rp));
+    }
+    for (const ri of ch.issues || []) {
+      if (outbox.issues.has(ri.id)) continue;
+      const idx = state.issues.findIndex(i => i.id === ri.id);
+      if (idx >= 0) state.issues[idx] = ri; else state.issues.push(ri);
+      snap.set(ri.id, sigOf(ri));
+    }
+    const del = new Set(ch.deleted || []);
+    if (del.size) {
+      state.projects = state.projects.filter(p => !del.has(p.id));
+      state.issues = state.issues.filter(i => !del.has(i.id) && !del.has(i.projectId));
+      for (const id of del) snap.delete(id);
+    }
+    normalize(state);
+    rebuildSnapKeepingPending();
+    refreshUi();
+  }
+  // normalize() may repair references; record those as known-to-server unless they are pending.
+  function rebuildSnapKeepingPending() {
+    const known = new Set([...state.projects.map(p => p.id), ...state.issues.map(i => i.id)]);
+    for (const id of [...snap.keys()]) if (!known.has(id)) snap.delete(id);
+  }
+
+  async function reloadState() {
+    const data = await api('GET', '/api/state');
+    authRequired = !!data.auth;
+    state.projects = data.projects;
+    state.issues = data.issues;
+    normalize(state);
+    rebuildSnap();
+    loaded = true;
+    refreshUi();
+  }
+
+  let events = null;
+  function connectEvents() {
+    if (events) events.close();
+    events = new EventSource('/api/events');
+    let opened = false;
+    events.addEventListener('change', e => { try { applyRemote(JSON.parse(e.data)); } catch (err) { console.warn(err); } });
+    events.addEventListener('reload', () => reloadState().catch(() => { }));
+    events.addEventListener('open', () => {
+      // After a reconnect we may have missed events: fetch everything again (once our queue is flushed).
+      if (opened && !outboxSize() && !sending) reloadState().catch(() => { });
+      opened = true;
+      if (saveStatus === 'offline') { setSaveStatus(outboxSize() ? 'busy' : 'ok'); sendOutbox(); }
+    });
+    events.addEventListener('error', () => { if (!outboxSize()) setSaveStatus('offline', '서버 연결 끊김 — 재연결 중'); });
   }
 
   let saveTimer = null;
   function flushSave() {
     if (saveTimer == null) return;
     clearTimeout(saveTimer); saveTimer = null;
-    const changed = trackChanges();
-    persistLocal();
-    if (changed) Sync.schedule(2500);
+    if (!loaded) return;
+    const ch = collectChanges();
+    if (ch.projects.length || ch.issues.length || ch.deleted.length) { enqueue(ch); sendOutbox(); }
   }
+  // Called after every mutation. Batches only what happens in the same tick (e.g. a drag that
+  // reorders several cards, or fast typing) — the request goes out right away.
   function save() {
+    savePrefs();
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(flushSave, 150);
+    saveTimer = setTimeout(flushSave, 120);
   }
-  window.addEventListener('beforeunload', () => { if (saveTimer == null) saveTimer = 0; flushSave(); });
-  // Keep multiple tabs in sync.
-  window.addEventListener('storage', e => {
-    if (e.key === STORAGE_KEY && e.newValue) {
-      try { state = normalize(JSON.parse(e.newValue)); rebuildSnap(); render(); if (currentIssueId) fillIssueModal(); } catch { }
-    }
+  window.addEventListener('beforeunload', e => {
+    if (saveTimer != null) flushSave();
+    if (outboxSize() || sending) { e.preventDefault(); e.returnValue = ''; }
   });
+
+  function setSaveStatus(s, msg = '') { saveStatus = s; saveMessage = msg; renderSaveStatus(); }
+  function renderSaveStatus() {
+    const b = $('#syncBtn');
+    if (!b) return;
+    const labels = { ok: '저장됨', busy: '저장 중…', error: '저장 실패', offline: '연결 끊김' };
+    b.dataset.status = saveStatus;
+    b.querySelector('.sync-label').textContent = labels[saveStatus] + (saveStatus !== 'ok' && outboxSize() ? ` (${outboxSize()})` : '');
+    b.title = (saveMessage || labels[saveStatus]) + (outboxSize() ? `\n전송 대기 중인 변경 ${outboxSize()}개 — 자동 재시도` : '\n모든 변경이 서버에 저장되었습니다');
+  }
+
+  function refreshUi() {
+    if (!loaded) return;
+    if (ui.quickAddCol && !project().columns.some(c => c.id === ui.quickAddCol)) ui.quickAddCol = null;
+    render();
+    if (!issueOverlay.hidden && !creating) fillIssueModal();
+  }
+
+  const getProjectById = id => state.projects.find(p => p.id === id);
 
   const project = () => state.projects.find(p => p.id === state.activeProjectId) || state.projects[0];
   const projectIssues = () => state.issues.filter(i => i.projectId === project().id);
@@ -245,6 +376,7 @@
   const listEl = $('#listView');
 
   function render() {
+    if (!loaded) return;
     applyTheme();
     renderHeader();
     if (ui.view === 'board') { boardEl.hidden = false; listEl.hidden = true; renderBoard(); }
@@ -921,7 +1053,7 @@
     build(body);
     dialogOverlay.hidden = false;
   }
-  function closeDialog() { dialogOverlay.hidden = true; }
+  function closeDialog() { if (!$('#loginPw')) dialogOverlay.hidden = true; }
   function btns(label, onOk) {
     const ok = el('button', { class: 'primary', text: label, onclick: () => { if (onOk() !== false) closeDialog(); } });
     const wrap = el('div', { class: 'btns' }, el('button', { class: 'text-btn', text: '취소', onclick: closeDialog }), ok);
@@ -971,9 +1103,10 @@
       const s = JSON.parse(await file.text());
       if (!Array.isArray(s.projects) || !Array.isArray(s.issues) || !s.projects.length) throw new Error('형식 오류');
       if (!confirm('현재 데이터를 가져온 파일로 덮어씁니다. 계속할까요?')) return;
-      s.deleted = state.deleted; // keep tombstones so removed items stay removed on other devices
-      s.theme = state.theme;
-      state = normalize(s); save(); render(); toast('가져오기 완료');
+      flushSave();
+      const data = await api('POST', '/api/import', { projects: s.projects, issues: s.issues });
+      state.projects = data.projects; state.issues = data.issues;
+      normalize(state); rebuildSnap(); render(); toast('가져오기 완료 (서버에 저장됨)');
     } catch (err) { toast('가져오기 실패: ' + err.message); }
   });
 
@@ -991,12 +1124,12 @@
   $('#menuBtn').addEventListener('click', () => dialog('메뉴', body => {
     const item = (text, fn, cls = '') => el('button', { class: 'menu-item ' + cls, text, onclick: () => { closeDialog(); fn(); } });
     body.append(
-      item('☁  기기 간 동기화 설정', syncDialog),
       item('⌨  키보드 단축키', showShortcuts),
       el('hr'),
       item('⬇  JSON 백업 내보내기 (전체)', exportJson),
       item('⬆  JSON 백업 가져오기', () => $('#importFile').click()),
       item('⬇  CSV 내보내기 (현재 프로젝트)', exportCsv),
+      ...(authRequired ? [item('로그아웃', logout)] : []),
       el('hr'),
       item('완료 컬럼 이슈 모두 삭제', () => {
         const done = projectIssues().filter(isDone);
@@ -1005,7 +1138,7 @@
         const ids = new Set(done.map(i => i.id));
         state.issues = state.issues.filter(i => !ids.has(i.id)); save(); render();
       }, 'danger'),
-      el('p', { class: 'muted', style: 'font-size:12px;margin:4px 0 0', text: Sync.enabled() ? `동기화: ${Sync.cfg.owner}/${Sync.cfg.repo} · ${Sync.cfg.path || 'kanban-data.json'}` : '데이터는 이 브라우저에만 저장됩니다. 동기화를 켜거나 JSON 백업을 내보내 두세요.' }),
+      el('p', { class: 'muted', style: 'font-size:12px;margin:4px 0 0', text: '모든 변경은 즉시 서버에 저장되고, 열려 있는 다른 기기에도 실시간으로 반영됩니다.' }),
     );
   }));
 
@@ -1029,13 +1162,14 @@
   $('#clearFilters').addEventListener('click', clearFilters);
   function clearFilters() { Object.assign(ui, { search: '', type: '', priority: '', label: '' }); saveUi(); render(); }
   $('#createBtn').addEventListener('click', () => openCreate());
-  $('#themeBtn').addEventListener('click', () => { state.theme = state.theme === 'dark' ? 'light' : 'dark'; save(); applyTheme(); });
+  $('#themeBtn').addEventListener('click', () => { state.theme = state.theme === 'dark' ? 'light' : 'dark'; savePrefs(); applyTheme(); });
 
   // ---------- global keyboard ----------
   document.addEventListener('keydown', e => {
     const tag = (e.target.tagName || '').toLowerCase();
     const typing = tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable;
 
+    if (!loaded) return;
     if (e.key === 'Escape') {
       if (!dialogOverlay.hidden) { closeDialog(); return; }
       if (!issueOverlay.hidden) { if (typing) e.target.blur(); closeIssue(); return; }
@@ -1059,294 +1193,6 @@
     } else if (e.key === 'Enter' && e.target.classList?.contains('card')) openIssue(e.target.dataset.id);
   });
 
-  // ---------- sync (backend = a JSON file in your own GitHub repo) ----------
-  // Every device reads the file, merges it with local data entity-by-entity (newest updatedAt wins,
-  // deletions are tombstones) and writes the result back using the file's sha for optimistic locking.
-  const SYNC_KEY = 'kanban.sync';
-
-  function stableStringify(v, space) {
-    const sortKeys = x => Array.isArray(x) ? x.map(sortKeys)
-      : x && typeof x === 'object' ? Object.fromEntries(Object.keys(x).sort().filter(k => x[k] !== undefined).map(k => [k, sortKeys(x[k])]))
-      : x;
-    return JSON.stringify(sortKeys(v), null, space);
-  }
-  // The part of the state that is shared between devices, in canonical order.
-  function sharedPart(s) {
-    const byId = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
-    return { version: 2, projects: [...s.projects].sort(byId), issues: [...s.issues].sort(byId), deleted: s.deleted || {} };
-  }
-
-  function mergeStates(local, remote) {
-    const deleted = { ...remote.deleted };
-    for (const [id, t] of Object.entries(local.deleted || {})) if (!deleted[id] || t > deleted[id]) deleted[id] = t;
-    // Forget tombstones after 180 days to keep the file small.
-    const cutoff = new Date(Date.now() - 180 * 86400000).toISOString();
-    for (const [id, t] of Object.entries(deleted)) if (t < cutoff) delete deleted[id];
-
-    const mergeList = (a, b) => {
-      const out = new Map();
-      for (const x of [...b, ...a]) {
-        const prev = out.get(x.id);
-        if (!prev || x.updatedAt > prev.updatedAt) out.set(x.id, x);
-      }
-      return [...out.values()].filter(x => !(deleted[x.id] && deleted[x.id] >= x.updatedAt));
-    };
-    const nextNums = {};
-    for (const p of [...remote.projects, ...local.projects]) nextNums[p.id] = Math.max(nextNums[p.id] || 1, p.nextNum || 1);
-
-    let projects = mergeList(local.projects, remote.projects).map(p => ({ ...p, nextNum: nextNums[p.id] }));
-    if (!projects.length) projects = local.projects.length ? local.projects : remote.projects;
-    const merged = normalize({
-      theme: local.theme,
-      activeProjectId: local.activeProjectId,
-      projects,
-      issues: mergeList(local.issues, remote.issues),
-      deleted,
-    });
-    // Two devices may have created the same number offline (DEV-7 twice): renumber the newer one.
-    const t = now();
-    for (const p of merged.projects) {
-      const seen = new Map();
-      const list = merged.issues.filter(i => i.projectId === p.id)
-        .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1));
-      for (const i of list) {
-        if (seen.has(i.num)) { i.num = p.nextNum++; i.updatedAt = t; }
-        seen.set(i.num, i);
-      }
-    }
-    return merged;
-  }
-
-  const toB64 = str => {
-    const bytes = new TextEncoder().encode(str);
-    let bin = '';
-    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    return btoa(bin);
-  };
-  const fromB64 = b64 => new TextDecoder().decode(Uint8Array.from(atob(b64.replace(/\s/g, '')), c => c.charCodeAt(0)));
-
-  const Sync = (() => {
-    let cfg = {};
-    try { cfg = JSON.parse(localStorage.getItem(SYNC_KEY) || '{}'); } catch { }
-    let status = cfg.enabled ? 'idle' : 'off';
-    let message = '';
-    let running = false, again = false, timer = null;
-    let replaceOnNext = false;
-
-    const saveCfg = () => { try { localStorage.setItem(SYNC_KEY, JSON.stringify(cfg)); } catch { } };
-    const enabled = () => !!(cfg.enabled && cfg.token && cfg.owner && cfg.repo);
-    const filePath = () => (cfg.path || 'kanban-data.json').split('/').map(encodeURIComponent).join('/');
-
-    class SyncError extends Error { constructor(msg, code) { super(msg); this.code = code; } }
-
-    async function api(method, path, body) {
-      let res;
-      try {
-        res = await fetch('https://api.github.com' + path, {
-          method, cache: 'no-store',
-          headers: {
-            Accept: 'application/vnd.github+json',
-            Authorization: 'Bearer ' + cfg.token,
-            'X-GitHub-Api-Version': '2022-11-28',
-            ...(body ? { 'Content-Type': 'application/json' } : {}),
-          },
-          body: body ? JSON.stringify(body) : undefined,
-        });
-      } catch { throw new SyncError('네트워크 연결 없음', 'offline'); }
-      if (res.ok) return res.json();
-      let detail = '';
-      try { detail = (await res.json()).message || ''; } catch { }
-      if (res.status === 401) throw new SyncError('토큰이 유효하지 않습니다 (만료/오타)', 401);
-      if (res.status === 403 && /rate limit/i.test(detail)) throw new SyncError('GitHub API 사용량 한도 초과 — 잠시 후 자동 재시도', 'rate');
-      if (res.status === 403) throw new SyncError('권한 없음 — 토큰에 Contents 읽기/쓰기 권한이 있는지 확인', 403);
-      throw new SyncError(detail || `HTTP ${res.status}`, res.status);
-    }
-
-    const repoPath = () => `/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`;
-
-    async function readRemote() {
-      const ref = cfg.branch ? `?ref=${encodeURIComponent(cfg.branch)}` : '';
-      let meta;
-      try { meta = await api('GET', `${repoPath()}/contents/${filePath()}${ref}`); }
-      catch (e) { if (e.code === 404) return { sha: null, data: null }; throw e; }
-      let b64 = meta.content;
-      if (!b64 && meta.size > 0) b64 = (await api('GET', `${repoPath()}/git/blobs/${meta.sha}`)).content; // > 1MB
-      const data = JSON.parse(fromB64(b64 || '') || 'null');
-      if (data && !validState(data)) throw new SyncError('원격 파일 형식이 올바르지 않습니다');
-      return { sha: meta.sha, data };
-    }
-
-    async function writeRemote(text, sha) {
-      const body = { message: `kanban: sync (${state.issues.length} issues)`, content: toB64(text) };
-      if (sha) body.sha = sha;
-      if (cfg.branch) body.branch = cfg.branch;
-      return api('PUT', `${repoPath()}/contents/${filePath()}`, body);
-    }
-
-    async function syncOnce() {
-      const remote = await readRemote();
-      flushSave(); // edits made while the request was in flight must be tracked before merging
-      const before = stableStringify(sharedPart(state));
-      let merged;
-      if (!remote.data) merged = state;
-      else if (replaceOnNext || state.pristine) {
-        merged = normalize({ ...remote.data, theme: state.theme, activeProjectId: state.activeProjectId });
-        merged.deleted ||= {};
-      } else merged = mergeStates(state, normalize(remote.data));
-      const mergedText = stableStringify(sharedPart(merged), 1);
-      const remoteText = remote.data ? stableStringify(sharedPart(normalize(remote.data)), 1) : null;
-
-      if (stableStringify(sharedPart(merged)) !== before) {
-        delete merged.pristine;
-        state = merged;
-        rebuildSnap();
-        persistLocal();
-        refreshUi();
-      }
-      if (mergedText !== remoteText) await writeRemote(mergedText, remote.sha);
-      replaceOnNext = false;
-      if (state.pristine) { delete state.pristine; persistLocal(); }
-    }
-
-    async function run() {
-      if (!enabled()) return;
-      if (running) { again = true; return; }
-      if (drag?.started) { schedule(1000); return; } // don't re-render under a dragged card
-      running = true; setStatus('busy');
-      try {
-        for (let attempt = 0; ; attempt++) {
-          flushSave();
-          const v = localVersion;
-          try { await syncOnce(); }
-          catch (e) {
-            // 409/422: someone else wrote the file between our read and write → re-read and merge again.
-            if ((e.code === 409 || e.code === 422) && attempt < 3) continue;
-            throw e;
-          }
-          if (localVersion !== v && attempt < 3) continue;
-          break;
-        }
-        cfg.lastSync = now(); saveCfg();
-        setStatus('ok');
-      } catch (e) {
-        setStatus(e.code === 'offline' ? 'offline' : 'error', e.message);
-      } finally {
-        running = false;
-        if (again) { again = false; schedule(500); }
-      }
-    }
-
-    function schedule(ms = 0) {
-      if (!enabled()) return;
-      clearTimeout(timer);
-      timer = setTimeout(run, ms);
-    }
-
-    function setStatus(s, msg = '') { status = s; message = msg; renderSyncButton(); }
-
-    function refreshUi() {
-      if (ui.quickAddCol && !project().columns.some(c => c.id === ui.quickAddCol)) ui.quickAddCol = null;
-      render();
-      if (!issueOverlay.hidden && !creating) fillIssueModal();
-    }
-
-    async function connect(next, replace) {
-      cfg = { ...cfg, ...next, enabled: true };
-      // Verify access before turning sync on.
-      try {
-        const repo = await api('GET', repoPath());
-        if (repo.permissions && !repo.permissions.push) throw new SyncError('이 저장소에 쓰기 권한이 없습니다');
-      } catch (e) {
-        cfg.enabled = false;
-        if (e.code === 404) throw new SyncError('저장소를 찾을 수 없습니다 (이름 또는 토큰의 저장소 접근 권한 확인)');
-        throw e;
-      }
-      saveCfg();
-      replaceOnNext = !!replace;
-      await run();
-      if (status === 'error') throw new SyncError(message);
-    }
-
-    function disconnect() {
-      clearTimeout(timer);
-      cfg = { owner: cfg.owner, repo: cfg.repo, branch: cfg.branch, path: cfg.path }; // forget the token
-      saveCfg();
-      setStatus('off');
-    }
-
-    // Triggers: periodic poll while visible, on focus, when back online.
-    setInterval(() => { if (document.visibilityState === 'visible') schedule(0); }, 30000);
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') schedule(0); });
-    window.addEventListener('online', () => schedule(0));
-
-    return {
-      schedule, run, connect, disconnect, enabled,
-      get cfg() { return cfg; }, get status() { return status; }, get message() { return message; },
-    };
-  })();
-
-  function renderSyncButton() {
-    const b = $('#syncBtn');
-    if (!b) return;
-    const s = Sync.status;
-    const labels = { off: '동기화 꺼짐', idle: '동기화 대기', busy: '동기화 중…', ok: '동기화됨', error: '동기화 오류', offline: '오프라인' };
-    b.dataset.status = s;
-    b.querySelector('.sync-label').textContent = labels[s];
-    const last = Sync.cfg.lastSync ? `\n마지막 동기화: ${fmtDate(Sync.cfg.lastSync)}` : '';
-    b.title = `${labels[s]}${Sync.message ? ' — ' + Sync.message : ''}${last}\n클릭해서 설정`;
-  }
-
-  function syncDialog() {
-    const c = Sync.cfg;
-    dialog('기기 간 동기화 (GitHub)', body => {
-      const owner = el('input', { value: c.owner || '', placeholder: '예: mygithubid', autocomplete: 'off' });
-      const repo = el('input', { value: c.repo || '', placeholder: '예: kanban-data (비공개 저장소 권장)', autocomplete: 'off' });
-      const branch = el('input', { value: c.branch || '', placeholder: '비우면 기본 브랜치', autocomplete: 'off' });
-      const path = el('input', { value: c.path || 'kanban-data.json', autocomplete: 'off' });
-      const token = el('input', { type: 'password', value: c.token || '', placeholder: 'github_pat_…', autocomplete: 'off' });
-      const replace = el('input', { type: 'checkbox' });
-      replace.checked = !!state.pristine;
-      const err = el('div', { class: 'sync-error', hidden: true });
-
-      body.append(
-        el('p', { class: 'muted sync-help', html:
-          '데이터를 <b>내 GitHub 저장소의 JSON 파일</b>에 저장해 여러 기기에서 같은 보드를 씁니다. 변경할 때마다 커밋되어 히스토리도 남습니다.<br>' +
-          '① 비공개 저장소를 하나 만들고 ② <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Fine-grained 토큰</a>을 발급하세요: ' +
-          'Repository access = 그 저장소만, Permissions → <b>Contents: Read and write</b>.' }),
-        el('div', { class: 'two' }, el('label', {}, '소유자 (계정/조직)', owner), el('label', {}, '저장소', repo)),
-        el('div', { class: 'two' }, el('label', {}, '브랜치', branch), el('label', {}, '파일 경로', path)),
-        el('label', {}, '토큰', token),
-        el('label', { class: 'row-label' }, replace, '이 기기의 데이터를 버리고 원격 데이터로 대체 (끄면 양쪽을 합침)'),
-        el('p', { class: 'muted', style: 'font-size:12px;margin:0', text: '토큰은 이 브라우저에만 저장되며 api.github.com 외에는 전송되지 않습니다.' }),
-        err,
-      );
-      const connectBtn = el('button', { class: 'primary', text: Sync.enabled() ? '저장 후 동기화' : '연결' });
-      connectBtn.addEventListener('click', async () => {
-        const next = { owner: owner.value.trim(), repo: repo.value.trim().replace(/\.git$/, ''), branch: branch.value.trim(), path: path.value.trim().replace(/^\/+/, '') || 'kanban-data.json', token: token.value.trim() };
-        // Accept "owner/repo" or a full URL pasted into the repo field.
-        const m = next.repo.match(/(?:github\.com\/)?([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/);
-        if (m) { next.owner = next.owner || m[1]; next.repo = m[2]; }
-        if (!next.owner || !next.repo || !next.token) { err.hidden = false; err.textContent = '소유자, 저장소, 토큰을 입력하세요'; return; }
-        connectBtn.disabled = true; connectBtn.textContent = '연결 중…'; err.hidden = true;
-        try {
-          await Sync.connect(next, replace.checked);
-          closeDialog(); toast('동기화 연결됨');
-        } catch (e) {
-          err.hidden = false; err.textContent = e.message;
-          connectBtn.disabled = false; connectBtn.textContent = '연결';
-          renderSyncButton();
-        }
-      });
-      const row = el('div', { class: 'btns' });
-      if (Sync.enabled()) row.append(el('button', { class: 'text-btn danger', text: '연결 해제', onclick: () => { Sync.disconnect(); closeDialog(); toast('동기화 해제됨 (데이터는 이 기기에 유지)'); } }), el('div', { class: 'spacer' }));
-      row.append(el('button', { class: 'text-btn', text: '닫기', onclick: closeDialog }), connectBtn);
-      body.append(row);
-      if (Sync.enabled() && Sync.message) { err.hidden = false; err.textContent = Sync.message; }
-      setTimeout(() => (owner.value ? token : owner).focus());
-    });
-  }
-  $('#syncBtn').addEventListener('click', syncDialog);
-
   // Deep link: #DEV-12 opens that issue.
   function openFromHash() {
     const m = decodeURIComponent(location.hash.slice(1)).match(/^([A-Z][A-Z0-9]*)-(\d+)$/);
@@ -1357,8 +1203,48 @@
   }
   window.addEventListener('hashchange', openFromHash);
 
-  render();
-  renderSyncButton();
-  openFromHash();
-  Sync.schedule(0);
+  // ---------- login / boot ----------
+  function showLogin(msg) {
+    if (!dialogOverlay.hidden && $('#loginPw')) return;
+    dialog('로그인', body => {
+      const pw = el('input', { id: 'loginPw', type: 'password', placeholder: '비밀번호', autocomplete: 'current-password' });
+      const err = el('div', { class: 'sync-error', hidden: !msg, text: msg || '' });
+      const go = el('button', { class: 'primary', text: '로그인' });
+      const submit = async () => {
+        go.disabled = true; err.hidden = true;
+        try {
+          await api('POST', '/api/login', { password: pw.value });
+          pw.remove(); closeDialog(); await boot();
+        } catch (e) { err.hidden = false; err.textContent = e.message; go.disabled = false; pw.select(); }
+      };
+      go.addEventListener('click', submit);
+      pw.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.isComposing) submit(); });
+      body.append(pw, err, el('div', { class: 'btns' }, go));
+      dialogOverlay.querySelector('[data-close]').hidden = true;
+      setTimeout(() => pw.focus());
+    });
+  }
+  async function logout() {
+    await api('POST', '/api/logout').catch(() => { });
+    location.reload();
+  }
+
+  async function boot() {
+    try {
+      await reloadState();
+    } catch (e) {
+      if (e.status === 401) { showLogin(); return; }
+      boardEl.innerHTML = '';
+      boardEl.append(el('div', { class: 'empty' }, `서버에 연결할 수 없습니다: ${e.message}`, el('br'), el('button', { class: 'primary', style: 'margin-top:12px', text: '다시 시도', onclick: boot })));
+      return;
+    }
+    dialogOverlay.querySelector('[data-close]').hidden = false;
+    renderSaveStatus();
+    connectEvents();
+    openFromHash();
+  }
+
+  applyTheme();
+  boardEl.append(el('div', { class: 'empty', text: '불러오는 중…' }));
+  boot();
 })();
