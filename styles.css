@@ -82,6 +82,30 @@ button { cursor: pointer; }
 .muted { color: var(--muted); font-weight: 400; }
 .spacer { flex: 1; }
 
+/* sync */
+.sync-btn {
+  display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); background: var(--surface);
+  border-radius: 14px; padding: 3px 10px; font-size: 12px; color: var(--muted); white-space: nowrap;
+}
+.sync-btn:hover { background: var(--col); }
+.sync-btn .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.sync-btn[data-status="ok"] .dot { background: #22c55e; }
+.sync-btn[data-status="idle"] .dot { background: #a3a3a3; }
+.sync-btn[data-status="busy"] .dot { background: var(--accent); animation: pulse 1s infinite; }
+.sync-btn[data-status="error"] .dot { background: var(--danger); }
+.sync-btn[data-status="error"] { color: var(--danger); border-color: var(--danger); }
+.sync-btn[data-status="offline"] .dot { background: #f59e0b; }
+@keyframes pulse { 50% { opacity: .3; } }
+.dialog-body .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.dialog-body .two label { min-width: 0; }
+.dialog-body .two input { width: 100%; }
+.dialog-body .row-label { flex-direction: row !important; align-items: center; gap: 8px !important; font-weight: 400 !important; color: var(--text) !important; }
+.sync-help { font-size: 12.5px; margin: 0; line-height: 1.6; }
+.sync-help a { color: var(--accent); }
+.sync-error { background: #fde2e2; color: #b91c1c; border-radius: 6px; padding: 8px 10px; font-size: 12.5px; }
+:root[data-theme="dark"] .sync-error { background: #4c1d1d; color: #fca5a5; }
+.small-modal { max-width: 520px; }
+
 /* ---------- board ---------- */
 main { flex: 1; min-height: 0; overflow: hidden; }
 .board {
@@ -266,6 +290,8 @@ kbd { background: var(--col); border: 1px solid var(--border); border-bottom-wid
   .search input { width: 100%; }
   .search { flex: 1 1 100%; }
   .actions { margin-left: auto; }
+  .sync-btn .sync-label { display: none; }
+  .dialog-body .two { grid-template-columns: 1fr; }
   .issue-body { grid-template-columns: 1fr; padding: 8px 16px 16px; }
   .board { padding: 12px; }
   .column { flex-basis: 85vw; }
